@@ -1,0 +1,791 @@
+// MRKv - Markdown Previewer (enhanced UI)
+// Public interface (properties / callbacks / structs) is backward compatible
+// with the original file. New, optional additions: `copy-code` callback,
+// `sidebar-visible` property, and the `Theme` global (light/dark).
+
+import { ListView, ScrollView } from "std-widgets.slint";
+
+export struct TreeNode {
+    text: string,
+    path: string,
+    is-dir: bool,
+    is-expanded: bool,
+    indent: int,
+    is-selected: bool,
+}
+
+// One image inside an image row (badges, logos side by side).
+export struct ImageItem {
+    image: image,
+    alt: string,
+    link: string,
+    asset-state: int, // 0 = none, 1 = loading, 2 = ready, 3 = error
+    asset-error: string,
+    width-hint: int,  // from HTML width="..." (0 = natural size)
+}
+
+export struct MarkdownBlock {
+    block-type: int, // 1-6 headings, 10 paragraph, 20 code, 30 list item, 40 blockquote, 50 hr, 60 image, 61 image row, 70 mermaid
+    content: string,
+    extra: string,   // language for code blocks, list marker, etc.
+    rich: styled-text,
+    image: image,
+    image-alt: string,
+    link: string,
+    asset-state: int, // 0 = none, 1 = loading, 2 = ready, 3 = error
+    asset-error: string,
+    anchor: string,
+    indent: int,
+    images: [ImageItem],
+    center: bool,
+    image-width-hint: int,
+}
+
+// ───────────────────────── Theme ─────────────────────────
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <color> bg:          dark ? #121418 : #faf9f6;
+    out property <color> sidebar:     dark ? #181b20 : #f1efe9;
+    out property <color> toolbar:     dark ? #181b20 : #f5f3ee;
+    out property <color> border:      dark ? #2b3038 : #dedbd2;
+    out property <color> hover:       dark ? #232830 : #e7e4da;
+    out property <color> pressed:     dark ? #2b313b : #dcd8cc;
+    out property <color> selected:    dark ? #1f3631 : #d7ebe4;
+
+    out property <color> fg:          dark ? #c9ced6 : #3a3f47;
+    out property <color> fg-strong:   dark ? #f1f3f5 : #14171c;
+    out property <color> fg-muted:    dark ? #7f8794 : #7a7f88;
+
+    out property <color> accent:      dark ? #5cc2a8 : #12796a;
+    out property <color> on-accent:   dark ? #0c1512 : #ffffff;
+
+    out property <color> code-bg:     dark ? #0e1013 : #f0eee8;
+    out property <color> code-head:   dark ? #171a1f : #e7e4da;
+    out property <color> code-fg:     dark ? #d8c9a6 : #5a3d1e;
+    out property <color> quote-bg:    dark ? #171b20 : #f0eee8;
+}
+
+// ───────────────────────── Small widgets ─────────────────────────
+component ToolButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> active: false;
+    in property <length> size: 30px;
+    callback clicked();
+
+    height: root.size;
+    border-radius: 6px;
+    background: root.primary ? (ta.pressed ? Theme.accent.darker(0.2) : ta.has-hover ? Theme.accent.brighter(0.15) : Theme.accent)
+              : root.active ? Theme.selected
+              : ta.pressed ? Theme.pressed
+              : ta.has-hover ? Theme.hover
+              : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.text;
+            color: root.primary ? Theme.on-accent : root.active ? Theme.accent : Theme.fg;
+            font-size: 13px;
+            font-weight: root.primary ? 600 : 500;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component TreeRow inherits Rectangle {
+    in property <TreeNode> node;
+    in property <float> zoom: 1.0;
+    callback activated();
+
+    height: 28px;
+    border-radius: 5px;
+    background: node.is-selected ? Theme.selected
+              : touch.pressed ? Theme.pressed
+              : touch.has-hover ? Theme.hover
+              : transparent;
+
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.activated(); }
+    }
+
+    // selection marker
+    if node.is-selected : Rectangle {
+        x: 0px;
+        y: 6px;
+        width: 3px;
+        height: parent.height - 12px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+
+    HorizontalLayout {
+        padding-left: node.indent * 14px + 10px;
+        padding-right: 8px;
+        spacing: 6px;
+        alignment: start;
+
+        Text {
+            width: 12px;
+            text: node.is-dir ? (node.is-expanded ? "▾" : "▸") : "";
+            color: Theme.fg-muted;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: node.text;
+            color: node.is-selected ? Theme.fg-strong : node.is-dir ? Theme.fg-strong : Theme.fg;
+            font-size: 13px * root.zoom;
+            font-weight: node.is-dir ? 600 : 400;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// One image of an image row. Natural size, capped to 40px tall unless the
+// HTML gave a width, and never wider than `row-max-width`.
+component ImageChip inherits Rectangle {
+    in property <ImageItem> item;
+    in property <length> row-max-width;
+    callback clicked(string);
+
+    property <bool> ready: item.asset-state == 2 && item.image.width > 0 && item.image.height > 0;
+    property <length> want-width: item.width-hint > 0 ? item.width-hint * 1px
+        : item.image.height > 40 ? 40px * item.image.width / item.image.height
+        : item.image.width * 1px;
+    property <length> fit-width: Math.min(want-width, Math.max(root.row-max-width, 1px));
+
+    width: root.ready ? root.fit-width : item.asset-state == 3 ? 96px : 48px;
+    height: root.ready ? root.fit-width * item.image.height / item.image.width : 20px;
+
+    if item.asset-state == 1 : Rectangle {
+        background: Theme.hover;
+        border-radius: 4px;
+    }
+
+    if root.ready : Image {
+        source: item.image;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+    }
+
+    if item.asset-state == 3 : Text {
+        width: parent.width;
+        height: parent.height;
+        text: item.alt != "" ? item.alt : "image";
+        color: Theme.fg-muted;
+        font-size: 11px;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+
+    if item.link != "" && root.ready : TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(item.link); }
+    }
+}
+
+// ───────────────────────── Markdown block renderer ─────────────────────────
+component MarkdownBlockView inherits VerticalLayout {
+    in property <MarkdownBlock> block;
+    in property <float> zoom: 1.0;
+    in property <length> side-padding: 32px;
+    in property <length> extra-top-padding: 0px;
+    in property <int> index: 0;
+    in property <int> scroll-index: -1;
+    in property <int> scroll-request: 0;
+    callback copy-code(string);
+    callback link-clicked(string);
+    callback reveal(length);
+
+    changed scroll-request => {
+        if (root.index == root.scroll-index) {
+            root.reveal(root.y);
+        }
+    }
+
+    property <bool> is-heading: block.block-type >= 1 && block.block-type <= 6;
+    property <length> h-size: block.block-type == 1 ? 30px
+                            : block.block-type == 2 ? 23px
+                            : block.block-type == 3 ? 19px
+                            : block.block-type == 4 ? 16px
+                            : 14px;
+    // Supplied by the window (not derived from root.width) to avoid layout binding loops.
+    in property <length> avail-width: 600px;
+    property <length> available-width: Math.max(root.avail-width, 1px);
+    property <length> hint-width: block.image-width-hint > 0 ? Math.min(block.image-width-hint * 1px, available-width) : 0px;
+    property <length> image-width: hint-width > 0px ? hint-width
+        : Math.min(available-width, Math.min(block.image.width * 1px,
+        700px * block.image.width / Math.max(block.image.height, 1)));
+    property <length> image-height: block.image.width > 0 ? image-width * block.image.height / block.image.width : 0px;
+
+    padding-left: side-padding;
+    padding-right: side-padding;
+    padding-bottom: 14px;
+    padding-top: (block.block-type <= 2 && is-heading ? 14px : is-heading ? 6px : 0px) + extra-top-padding;
+    spacing: 4px;
+
+    // Headings (h1/h2 get an underline rule)
+    if is-heading : VerticalLayout {
+        spacing: 8px;
+        StyledText {
+            text: block.rich;
+            default-color: block.block-type == 6 ? Theme.fg-muted : Theme.fg-strong;
+            default-font-size: root.h-size * root.zoom;
+            link-color: Theme.accent;
+            link-clicked(link) => { root.link-clicked(link); }
+        }
+        if block.block-type <= 2 : Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+    }
+
+    // Paragraph
+    if block.block-type == 10 : StyledText {
+        text: block.rich;
+        default-color: Theme.fg;
+        default-font-size: 15px * root.zoom;
+        link-color: Theme.accent;
+        link-clicked(link) => { root.link-clicked(link); }
+    }
+
+    // Code block
+    if block.block-type == 20 : Rectangle {
+        background: Theme.code-bg;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+
+        VerticalLayout {
+            Rectangle {
+                height: 30px;
+                background: Theme.code-head;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 4px;
+                    spacing: 8px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: block.extra != "" ? block.extra : "text";
+                        color: Theme.fg-muted;
+                        font-size: 11px * root.zoom;
+                        font-family: "monospace";
+                        vertical-alignment: center;
+                    }
+                    ToolButton {
+                        text: "Copy";
+                        size: 22px;
+                        y: 4px;
+                        clicked => { root.copy-code(block.content); }
+                    }
+                }
+            }
+            HorizontalLayout {
+                padding: 14px;
+                Text {
+                    text: block.content;
+                    color: Theme.code-fg;
+                    font-size: 13px * root.zoom;
+                    font-family: "monospace";
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // List item
+    if block.block-type == 30 : HorizontalLayout {
+        padding-left: 6px + block.indent * 20px;
+        spacing: 10px;
+        Text {
+            text: block.extra != "" ? block.extra : "•";
+            color: Theme.accent;
+            font-size: 15px * root.zoom;
+            font-weight: 700;
+        }
+        StyledText {
+            horizontal-stretch: 1;
+            text: block.rich;
+            default-color: Theme.fg;
+            default-font-size: 15px * root.zoom;
+            link-color: Theme.accent;
+            link-clicked(link) => { root.link-clicked(link); }
+        }
+    }
+
+    // Blockquote
+    if block.block-type == 40 : Rectangle {
+        background: Theme.quote-bg;
+        border-radius: 6px;
+        clip: true;
+
+        HorizontalLayout {
+            Rectangle {
+                width: 3px;
+                background: Theme.accent;
+            }
+            HorizontalLayout {
+                padding: 12px;
+                padding-left: 14px;
+                StyledText {
+                    horizontal-stretch: 1;
+                    text: block.rich;
+                    default-color: Theme.fg-muted;
+                    default-font-size: 15px * root.zoom;
+                    link-color: Theme.accent;
+                    link-clicked(link) => { root.link-clicked(link); }
+                }
+            }
+        }
+    }
+
+    // Image
+    if block.block-type == 60 : VerticalLayout {
+        spacing: 5px;
+
+        HorizontalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: root.image-width;
+                height: root.image-height;
+                background: transparent;
+
+                if block.asset-state == 2 : Image {
+                    source: block.image;
+                    width: parent.width;
+                    height: parent.height;
+                    image-fit: contain;
+                }
+
+                if block.link != "" && block.asset-state == 2 : TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.link-clicked(block.link); }
+                }
+            }
+        }
+
+        if block.asset-state == 1 : Text {
+            text: "Loading image...";
+            color: Theme.fg-muted;
+            font-size: 12px * root.zoom;
+            horizontal-alignment: center;
+        }
+
+        if block.asset-state == 3 : Text {
+            text: "Could not load image" + (block.image-alt != "" ? " (" + block.image-alt + ")" : "") + ": " + block.asset-error;
+            color: Theme.fg-muted;
+            font-size: 12px * root.zoom;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+
+    }
+
+    // Image row: consecutive images (badges, logos) laid out side by side
+    if block.block-type == 61 : HorizontalLayout {
+        alignment: block.center ? LayoutAlignment.center : LayoutAlignment.start;
+        spacing: 6px;
+
+        for item in block.images : ImageChip {
+            item: item;
+            row-max-width: (root.available-width - 6px * (block.images.length - 1)) / Math.max(block.images.length, 1);
+            clicked(link) => { root.link-clicked(link); }
+        }
+    }
+
+    // Mermaid diagram
+    if block.block-type == 70 : Rectangle {
+        background: Theme.code-bg;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+
+        VerticalLayout {
+            Rectangle {
+                height: 30px;
+                background: Theme.code-head;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Mermaid";
+                        color: Theme.fg-muted;
+                        font-size: 11px * root.zoom;
+                        font-family: "monospace";
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if block.asset-state == 2 && root.image-width > 0 : HorizontalLayout {
+                alignment: center;
+                padding: 12px;
+
+                Image {
+                    width: root.image-width;
+                    height: root.image-height;
+                    source: block.image;
+                    image-fit: contain;
+                }
+            }
+
+            if block.asset-state == 1 : VerticalLayout {
+                padding: 16px;
+
+                Text {
+                    text: "Rendering diagram...";
+                    color: Theme.fg-muted;
+                    font-size: 12px * root.zoom;
+                    horizontal-alignment: center;
+                }
+            }
+
+            if block.asset-state == 3 : VerticalLayout {
+                spacing: 6px;
+                padding: 12px;
+
+                Text {
+                    text: "Mermaid error: " + block.asset-error;
+                    color: Theme.fg-muted;
+                    font-size: 12px * root.zoom;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: block.content;
+                    color: Theme.code-fg;
+                    font-size: 12px * root.zoom;
+                    font-family: "monospace";
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    // Horizontal rule
+    if block.block-type == 50 : VerticalLayout {
+        padding-top: 8px;
+        padding-bottom: 8px;
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+    }
+}
+
+// ───────────────────────── Main window ─────────────────────────
+export component MainWindow inherits Window {
+    title: "MRKv - Markdown Previewer";
+    preferred-width: 1100px;
+    preferred-height: 750px;
+    min-width: 720px;
+    min-height: 460px;
+    background: Theme.bg;
+
+    in-out property <[TreeNode]> tree-nodes: [];
+    in-out property <[MarkdownBlock]> markdown-blocks: [];
+    in-out property <string> current-file-path: "No file selected";
+    in-out property <string> current-workspace-path: "";
+    in-out property <bool> has-parent-folder: false;
+    in-out property <float> font-scale: 1.0;
+    in-out property <bool> sidebar-visible: true;
+
+    callback select-node(string);
+    callback toggle-folder(string);
+    callback open-folder-dialog();
+    callback open-parent-folder();
+    callback copy-code(string); // optional: wire up to a clipboard crate in Rust
+    callback link-clicked(string);
+    callback theme-changed();
+
+    function zoom-in()  { root.font-scale = Math.min(root.font-scale + 0.1, 2.0); }
+    function zoom-out() { root.font-scale = Math.max(root.font-scale - 0.1, 0.7); }
+    function zoom-reset() { root.font-scale = 1.0; }
+
+    property <int> scroll-index: -1;
+    property <int> scroll-request: 0;
+
+    public function reset-scroll() {
+        preview-list.content-y = 0px;
+    }
+
+    // Asks the block at `index` to report its real y position (see `reveal` below).
+    public function scroll-to-block(index: int) {
+        if (index >= 0 && index < root.markdown-blocks.length) {
+            root.scroll-index = index;
+            root.scroll-request += 1;
+        }
+    }
+
+    init => { keys.focus(); }
+
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.modifiers.control || event.modifiers.meta) {
+                if (event.text == "=" || event.text == "+") { root.zoom-in(); return accept; }
+                if (event.text == "-") { root.zoom-out(); return accept; }
+                if (event.text == "0") { root.zoom-reset(); return accept; }
+                if (event.text == "b") { root.sidebar-visible = !root.sidebar-visible; return accept; }
+                if (event.text == "o") { root.open-folder-dialog(); return accept; }
+            }
+            reject
+        }
+
+        VerticalLayout {
+            HorizontalLayout {
+                // ───────── Sidebar ─────────
+                Rectangle {
+                    width: root.sidebar-visible ? 280px : 0px;
+                    background: Theme.sidebar;
+                    clip: true;
+
+                    Rectangle {
+                        x: parent.width - 1px;
+                        width: 1px;
+                        background: Theme.border;
+                    }
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            height: 32px;
+                            spacing: 8px;
+                            Text {
+                                text: "Explorer";
+                                color: Theme.fg-strong;
+                                font-size: 15px * root.font-scale;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            ToolButton {
+                                text: "Open folder";
+                                primary: true;
+                                clicked => { root.open-folder-dialog(); }
+                            }
+                        }
+
+                        if root.current-workspace-path != "" : Text {
+                            text: root.current-workspace-path;
+                            color: Theme.fg-muted;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        if root.has-parent-folder : ToolButton {
+                            text: "↑  Show parent folder";
+                            size: 28px;
+                            clicked => { root.open-parent-folder(); }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.border;
+                        }
+
+                        if root.tree-nodes.length == 0 : Text {
+                            text: "No folder open.\nUse “Open folder” to browse your notes.";
+                            color: Theme.fg-muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+
+                        if root.tree-nodes.length > 0 : ListView {
+                            vertical-stretch: 1;
+
+                            for node in root.tree-nodes : TreeRow {
+                                node: node;
+                                zoom: root.font-scale;
+                                activated => {
+                                    root.select-node(node.path);
+                                    if (node.is-dir) {
+                                        root.toggle-folder(node.path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ───────── Preview pane ─────────
+                main := Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.bg;
+
+                    VerticalLayout {
+                        // Toolbar
+                        Rectangle {
+                            height: 46px;
+                            background: Theme.toolbar;
+
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Theme.border;
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 12px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                spacing: 6px;
+
+                                ToolButton {
+                                    text: root.sidebar-visible ? "◧" : "▣";
+                                    active: root.sidebar-visible;
+                                    clicked => { root.sidebar-visible = !root.sidebar-visible; }
+                                }
+
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.current-file-path;
+                                    color: Theme.fg-muted;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+
+                                ToolButton {
+                                    text: "A−";
+                                    clicked => { root.zoom-out(); }
+                                }
+                                ToolButton {
+                                    text: "\{Math.round(root.font-scale * 100)}%";
+                                    clicked => { root.zoom-reset(); }
+                                }
+                                ToolButton {
+                                    text: "A+";
+                                    clicked => { root.zoom-in(); }
+                                }
+                                ToolButton {
+                                    text: Theme.dark ? "Light" : "Dark";
+                                    clicked => {
+                                        Theme.dark = !Theme.dark;
+                                        root.theme-changed();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Content
+                        preview-list := ScrollView {
+                            vertical-stretch: 1;
+
+                            VerticalLayout {
+                                padding-left: Math.max((main.width - 720px * root.font-scale) / 2, 32px);
+                                padding-right: Math.max((main.width - 720px * root.font-scale) / 2, 32px);
+                                padding-top: 32px;
+                                padding-bottom: 48px;
+                                spacing: 14px;
+                                alignment: start;
+
+                                if root.markdown-blocks.length == 0 : VerticalLayout {
+                                    alignment: center;
+                                    spacing: 10px;
+                                    padding-top: 110px;
+
+                                    Text {
+                                        text: "Preview your Markdown";
+                                        color: Theme.fg-strong;
+                                        font-size: 26px * root.font-scale;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "Open a folder, then pick a Markdown file from the sidebar.";
+                                        color: Theme.fg-muted;
+                                        font-size: 14px * root.font-scale;
+                                        horizontal-alignment: center;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        padding-top: 10px;
+                                        alignment: center;
+                                        ToolButton {
+                                            text: "Open folder";
+                                            primary: true;
+                                            size: 36px;
+                                            clicked => { root.open-folder-dialog(); }
+                                        }
+                                    }
+                                    Text {
+                                        text: "Ctrl+O open · Ctrl+B sidebar · Ctrl +/− zoom";
+                                        color: Theme.fg-muted;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+
+                                for b[i] in root.markdown-blocks : MarkdownBlockView {
+                                    index: i;
+                                    avail-width: Math.max(main.width - 2 * Math.max((main.width - 720px * root.font-scale) / 2, 32px) - 2 * 32px - 16px, 1px);
+                                    scroll-index: root.scroll-index;
+                                    scroll-request: root.scroll-request;
+                                    reveal(y) => {
+                                        preview-list.content-y = Math.min(0px, Math.max(-y, preview-list.height - preview-list.content-height));
+                                    }
+                                    block: b;
+                                    zoom: root.font-scale;
+                                    copy-code(text) => { root.copy-code(text); }
+                                    link-clicked(link) => { root.link-clicked(link); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ───────── Status bar ─────────
+            Rectangle {
+                height: 24px;
+                background: Theme.toolbar;
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 16px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.markdown-blocks.length == 0 ? "Ready" : "\{root.markdown-blocks.length} blocks";
+                        color: Theme.fg-muted;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: "Zoom \{Math.round(root.font-scale * 100)}%";
+                        color: Theme.fg-muted;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
