@@ -12,33 +12,66 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const ASSET_WORKERS: usize = 4;
 /// Images larger than this (in either dimension) are downscaled in the worker.
 const MAX_IMAGE_DIMENSION: u32 = 2000;
+/// How long the UI thread may spend per tick building blocks / applying assets.
+const LOAD_BUDGET: Duration = Duration::from_millis(6);
+const RESULT_BUDGET: Duration = Duration::from_millis(6);
+
+/// CPU work scales with cores; downloads are IO-bound, so oversubscribe 2x.
+fn worker_count() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cores * 2).clamp(4, 32)
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "mrkv", author, version, about = "Linux native Markdown previewer")]
+#[command(
+    name = "mrkv",
+    author,
+    version,
+    about = "Linux native Markdown previewer"
+)]
 struct Cli {
     /// Path to a markdown file or directory to open
     path: Option<PathBuf>,
+}
+
+struct DocResult {
+    generation: u64,
+    path: PathBuf,
+    anchor: Option<String>,
+    result: Result<Vec<markdown::ParsedBlock>, String>,
+}
+
+/// A document whose blocks are still being appended to the model.
+struct PendingLoad {
+    generation: u64,
+    base_dir: PathBuf,
+    model: Rc<VecModel<MarkdownBlock>>,
+    blocks: std::vec::IntoIter<markdown::ParsedBlock>,
+    next_index: usize,
+    anchor: Option<String>,
 }
 
 #[derive(Clone)]
 struct RenderState {
     generation: Rc<Cell<u64>>,
     current_model: Rc<RefCell<Option<Rc<VecModel<MarkdownBlock>>>>>,
+    pending: Rc<RefCell<Option<PendingLoad>>>,
     job_tx: Sender<AssetJob>,
+    doc_tx: Sender<DocResult>,
 }
 
 enum AssetJob {
     Image {
         generation: u64,
         index: usize,
-        /// `Some(i)` when the image belongs to an image row (block type 61).
         sub: Option<usize>,
         source: String,
     },
@@ -57,14 +90,11 @@ struct AssetResult {
     result: Result<AssetPayload, String>,
 }
 
+/// Cheap to clone (Arc-backed), so cache hits no longer copy megabytes.
 #[derive(Clone)]
 enum AssetPayload {
-    Rgba {
-        width: u32,
-        height: u32,
-        pixels: Vec<u8>,
-    },
-    Svg(Vec<u8>),
+    Rgba(SharedPixelBuffer<Rgba8Pixel>),
+    Svg(Arc<Vec<u8>>),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,6 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (job_tx, job_rx) = mpsc::channel::<AssetJob>();
     let (result_tx, result_rx) = mpsc::channel::<AssetResult>();
+    let (doc_tx, doc_rx) = mpsc::channel::<DocResult>();
 
     let image_cache = Arc::new(Mutex::new(HashMap::<String, AssetPayload>::new()));
     let mermaid_cache = Arc::new(Mutex::new(HashMap::<String, AssetPayload>::new()));
@@ -107,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(20))
         .build();
 
-    for worker in 0..ASSET_WORKERS {
+    for worker in 0..worker_count() {
         let job_rx = Arc::clone(&job_rx);
         let result_tx = result_tx.clone();
         let image_cache = Arc::clone(&image_cache);
@@ -125,37 +156,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let render_state = RenderState {
         generation: Rc::new(Cell::new(0)),
         current_model: Rc::new(RefCell::new(None)),
+        pending: Rc::new(RefCell::new(None)),
         job_tx,
+        doc_tx,
     };
 
-    // Helper to refresh tree view in UI
+    // One persistent model; only changed rows are touched.
+    let tree_model = Rc::new(VecModel::<TreeNode>::default());
+    main_window.set_tree_nodes(ModelRc::from(tree_model.clone()));
+
     let update_tree_ui = {
-        let window_weak = main_window.as_weak();
         let tree_state = Rc::clone(&tree_state);
+        let tree_model = Rc::clone(&tree_model);
         move || {
-            if let Some(win) = window_weak.upgrade() {
-                let state = tree_state.borrow();
-                let visible_nodes = state.build_visible_list();
+            let state = tree_state.borrow();
+            let nodes: Vec<TreeNode> = state
+                .build_visible_list()
+                .into_iter()
+                .map(|(info, indent)| {
+                    let is_selected = state
+                        .selected_path
+                        .as_ref()
+                        .map_or(false, |p| p.to_string_lossy() == info.path);
+                    TreeNode {
+                        text: info.text.into(),
+                        path: info.path.into(),
+                        is_dir: info.is_dir,
+                        is_expanded: info.is_expanded,
+                        indent,
+                        is_selected,
+                    }
+                })
+                .collect();
 
-                let slint_nodes: Vec<TreeNode> = visible_nodes
-                    .into_iter()
-                    .map(|(info, indent)| {
-                        let is_selected = state
-                            .selected_path
-                            .as_ref()
-                            .map_or(false, |p| p.to_string_lossy() == info.path);
-                        TreeNode {
-                            text: info.text.into(),
-                            path: info.path.into(),
-                            is_dir: info.is_dir,
-                            is_expanded: info.is_expanded,
-                            indent,
-                            is_selected,
+            if tree_model.row_count() == nodes.len() {
+                for (i, node) in nodes.into_iter().enumerate() {
+                    if let Some(old) = tree_model.row_data(i) {
+                        if old.path != node.path
+                            || old.is_expanded != node.is_expanded
+                            || old.is_selected != node.is_selected
+                            || old.indent != node.indent
+                        {
+                            tree_model.set_row_data(i, node);
                         }
-                    })
-                    .collect();
-
-                win.set_tree_nodes(ModelRc::new(VecModel::from(slint_nodes)));
+                    }
+                }
+            } else {
+                tree_model.set_vec(nodes);
             }
         }
     };
@@ -227,6 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let mut state = tree_state_clone.borrow_mut();
                     state.root_path = new_root.clone();
+                    state.refresh();
                     state.expanded_dirs.clear();
                     state.expanded_dirs.insert(new_root.clone());
                     state.selected_path = None;
@@ -249,6 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let mut state = tree_state_clone.borrow_mut();
                     state.root_path = parent_path.clone();
+                    state.refresh();
                     state.expanded_dirs.clear();
                     state.expanded_dirs.insert(parent_path.clone());
                     state.expanded_dirs.insert(current_root.clone());
@@ -292,52 +341,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timer = slint::Timer::default();
     {
         let window_weak = main_window.as_weak();
-        let current_model = Rc::clone(&render_state.current_model);
-        let generation = Rc::clone(&render_state.generation);
+        let rs = render_state.clone();
 
         timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(50),
-            move || loop {
-                match result_rx.try_recv() {
-                    Ok(result) => {
-                        if result.generation != generation.get() {
-                            continue;
+            Duration::from_millis(16),
+            move || {
+                let Some(win) = window_weak.upgrade() else {
+                    return;
+                };
+
+                // 1. Documents parsed on the background thread.
+                while let Ok(doc) = doc_rx.try_recv() {
+                    if doc.generation != rs.generation.get() {
+                        continue;
+                    }
+                    match doc.result {
+                        Ok(blocks) => {
+                            let model = Rc::new(VecModel::<MarkdownBlock>::default());
+                            win.set_markdown_blocks(ModelRc::from(model.clone()));
+                            win.invoke_reset_scroll();
+                            *rs.current_model.borrow_mut() = Some(model.clone());
+
+                            let base_dir = doc
+                                .path
+                                .parent()
+                                .map(Path::to_path_buf)
+                                .unwrap_or_else(|| PathBuf::from("."));
+                            *rs.pending.borrow_mut() = Some(PendingLoad {
+                                generation: doc.generation,
+                                base_dir,
+                                model,
+                                blocks: blocks.into_iter(),
+                                next_index: 0,
+                                anchor: doc.anchor,
+                            });
                         }
-
-                        let Some(win) = window_weak.upgrade() else {
-                            break;
-                        };
-
-                        let model = current_model.borrow().clone();
-                        let Some(model) = model else {
-                            continue;
-                        };
-
-                        if result.index >= model.row_count() {
-                            continue;
-                        }
-
-                        let Some(mut block) = model.row_data(result.index) else {
-                            continue;
-                        };
-
-                        match result.sub {
-                            Some(sub) => {
-                                // Image inside a row: update just that item.
-                                if let Some(mut item) = block.images.row_data(sub) {
-                                    apply_image_item_result(&mut item, result.result);
-                                    block.images.set_row_data(sub, item);
-                                }
-                            }
-                            None => {
-                                apply_asset_result(&win, &mut block, result.result);
-                                model.set_row_data(result.index, block);
-                            }
+                        Err(message) => {
+                            let model = Rc::new(VecModel::from(vec![error_block(&message)]));
+                            win.set_markdown_blocks(ModelRc::from(model.clone()));
+                            win.invoke_reset_scroll();
+                            *rs.current_model.borrow_mut() = Some(model);
                         }
                     }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
+                }
+
+                // 2. Append blocks in small slices so the UI never stalls.
+                let mut finished_anchor: Option<String> = None;
+                let mut finished = false;
+                if let Some(p) = rs.pending.borrow_mut().as_mut() {
+                    if p.generation != rs.generation.get() {
+                        finished = true;
+                    } else {
+                        let dark = win.global::<Theme>().get_dark();
+                        let start = Instant::now();
+                        let mut batch = Vec::new();
+                        let mut jobs = Vec::new();
+
+                        while let Some(parsed) = p.blocks.next() {
+                            batch.push(build_block(
+                                parsed,
+                                p.next_index,
+                                p.generation,
+                                &p.base_dir,
+                                dark,
+                                &mut jobs,
+                            ));
+                            p.next_index += 1;
+                            if start.elapsed() >= LOAD_BUDGET {
+                                break;
+                            }
+                        }
+
+                        p.model.extend(batch);
+                        for job in jobs {
+                            let _ = rs.job_tx.send(job);
+                        }
+
+                        if p.blocks.len() == 0 {
+                            finished = true;
+                            finished_anchor = p.anchor.take();
+                        }
+                    }
+                }
+                if finished {
+                    *rs.pending.borrow_mut() = None;
+                }
+                if let Some(anchor) = finished_anchor {
+                    schedule_anchor_scroll(&win, &rs, anchor);
+                }
+
+                // 3. Finished images / diagrams.
+                let model = rs.current_model.borrow().clone();
+                let start = Instant::now();
+                while let Ok(result) = result_rx.try_recv() {
+                    if result.generation != rs.generation.get() {
+                        continue;
+                    }
+                    if let Some(model) = &model {
+                        apply_result(&win, model, result);
+                    }
+                    if start.elapsed() >= RESULT_BUDGET {
+                        break;
+                    }
                 }
             },
         );
@@ -357,158 +463,188 @@ fn render_file(
 ) {
     let generation = render_state.generation.get().wrapping_add(1);
     render_state.generation.set(generation);
+    *render_state.pending.borrow_mut() = None;
 
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let parsed_blocks = markdown::parse_markdown(&content);
-            let base_dir = path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            let dark = window.global::<Theme>().get_dark();
+    window.set_current_file_path(path.to_string_lossy().to_string().into());
+    tree_state.borrow_mut().selected_path = Some(path.to_path_buf());
 
-            let mut slint_blocks = Vec::with_capacity(parsed_blocks.len());
-            let mut jobs = Vec::new();
+    // Read + parse on another thread; the UI timer picks up the result.
+    let tx = render_state.doc_tx.clone();
+    let path = path.to_path_buf();
+    let anchor = pending_anchor.filter(|a| !a.is_empty()).map(str::to_string);
 
-            for (index, parsed) in parsed_blocks.into_iter().enumerate() {
-                let rich = if parsed.rich.is_empty() {
-                    StyledText::from_plain_text(&parsed.content)
-                } else {
-                    StyledText::from_markdown(&parsed.rich)
-                        .unwrap_or_else(|_| StyledText::from_plain_text(&parsed.content))
-                };
+    std::thread::spawn(move || {
+        let result = std::fs::read_to_string(&path)
+            .map(|content| markdown::parse_markdown(&content))
+            .map_err(|err| format!("Error reading file: {}", err));
+        let _ = tx.send(DocResult {
+            generation,
+            path,
+            anchor,
+            result,
+        });
+    });
+}
 
-                let mut asset_state = 0;
-                let mut asset_error = String::new();
-                let mut row_images: Vec<ImageItem> = Vec::new();
+fn build_block(
+    parsed: markdown::ParsedBlock,
+    index: usize,
+    generation: u64,
+    base_dir: &Path,
+    dark: bool,
+    jobs: &mut Vec<AssetJob>,
+) -> MarkdownBlock {
+    let rich = if parsed.rich.is_empty() {
+        StyledText::from_plain_text(&parsed.content)
+    } else {
+        StyledText::from_markdown(&parsed.rich)
+            .unwrap_or_else(|_| StyledText::from_plain_text(&parsed.content))
+    };
 
-                if parsed.block_type == 61 {
-                    for (sub, img) in parsed.images.iter().enumerate() {
-                        let mut item = ImageItem {
-                            image: Image::default(),
-                            alt: img.alt.clone().into(),
-                            link: img.link.clone().into(),
-                            asset_state: 0,
-                            asset_error: "".into(),
-                            width_hint: img.width,
-                        };
+    let mut asset_state = 0;
+    let mut asset_error = String::new();
+    let mut row_images: Vec<ImageItem> = Vec::new();
 
-                        match resolve_image_source(&img.src, &base_dir) {
-                            Some(source) => {
-                                item.asset_state = 1;
-                                jobs.push(AssetJob::Image {
-                                    generation,
-                                    index,
-                                    sub: Some(sub),
-                                    source,
-                                });
-                            }
-                            None => {
-                                item.asset_state = 3;
-                                item.asset_error = "Unsupported image source".into();
-                            }
-                        }
+    let table_rows: Vec<TableRow> = parsed
+        .rows
+        .iter()
+        .map(|row| TableRow {
+            header: row.header,
+            cells: ModelRc::new(VecModel::from(
+                row.cells
+                    .iter()
+                    .map(|cell| TableCell {
+                        rich: if cell.rich.is_empty() {
+                            StyledText::from_plain_text(&cell.plain)
+                        } else {
+                            StyledText::from_markdown(&cell.rich)
+                                .unwrap_or_else(|_| StyledText::from_plain_text(&cell.plain))
+                        },
+                        text: cell.plain.clone().into(),
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+        })
+        .collect();
 
-                        row_images.push(item);
-                    }
-                } else if parsed.block_type == 60 {
-                    if parsed.image_src.trim().is_empty() {
-                        asset_state = 3;
-                        asset_error = "Missing image source".to_string();
-                    } else if let Some(source) =
-                        resolve_image_source(&parsed.image_src, &base_dir)
-                    {
-                        asset_state = 1;
-                        jobs.push(AssetJob::Image {
-                            generation,
-                            index,
-                            sub: None,
-                            source,
-                        });
-                    } else {
-                        asset_state = 3;
-                        asset_error = "Unsupported image source".to_string();
-                    }
-                } else if parsed.block_type == 70 {
-                    asset_state = 1;
-                    jobs.push(AssetJob::Mermaid {
-                        generation,
-                        index,
-                        source: parsed.content.clone(),
-                        dark,
-                    });
-                }
-
-                slint_blocks.push(MarkdownBlock {
-                    block_type: parsed.block_type,
-                    content: parsed.content.into(),
-                    extra: parsed.extra.into(),
-                    rich,
-                    image: Image::default(),
-                    image_alt: parsed.image_alt.into(),
-                    link: parsed.link.into(),
-                    asset_state,
-                    asset_error: asset_error.into(),
-                    anchor: parsed.anchor.into(),
-                    indent: parsed.indent,
-                    images: ModelRc::new(VecModel::from(row_images)),
-                    center: parsed.center,
-                    image_width_hint: parsed.image_width,
-                });
-            }
-
-            let model = Rc::new(VecModel::from(slint_blocks));
-            window.set_markdown_blocks(ModelRc::from(model.clone()));
-            window.set_current_file_path(path.to_string_lossy().to_string().into());
-            *render_state.current_model.borrow_mut() = Some(model);
-
-            for job in jobs {
-                let _ = render_state.job_tx.send(job);
-            }
-
-            tree_state.borrow_mut().selected_path = Some(path.to_path_buf());
-
-            window.invoke_reset_scroll();
-
-            if let Some(anchor) = pending_anchor.filter(|anchor| !anchor.is_empty()) {
-                schedule_anchor_scroll(window, render_state, anchor.to_string());
-            }
-        }
-        Err(err) => {
-            eprintln!("Failed to read file {}: {}", path.display(), err);
-
-            let message = format!("Error reading file: {}", err);
-            let model = Rc::new(VecModel::from(vec![MarkdownBlock {
-                block_type: 10,
-                content: message.clone().into(),
-                extra: "".into(),
-                rich: StyledText::from_plain_text(&message),
+    if parsed.block_type == 61 {
+        for (sub, img) in parsed.images.iter().enumerate() {
+            let mut item = ImageItem {
                 image: Image::default(),
-                image_alt: "".into(),
-                link: "".into(),
+                alt: img.alt.clone().into(),
+                link: img.link.clone().into(),
                 asset_state: 0,
                 asset_error: "".into(),
-                anchor: "".into(),
-                indent: 0,
-                images: ModelRc::new(VecModel::from(Vec::<ImageItem>::new())),
-                center: false,
-                image_width_hint: 0,
-            }]));
+                width_hint: img.width,
+            };
 
-            window.set_markdown_blocks(ModelRc::from(model.clone()));
-            window.set_current_file_path(path.to_string_lossy().to_string().into());
-            *render_state.current_model.borrow_mut() = Some(model);
-            window.invoke_reset_scroll();
+            match resolve_image_source(&img.src, base_dir) {
+                Some(source) => {
+                    item.asset_state = 1;
+                    jobs.push(AssetJob::Image {
+                        generation,
+                        index,
+                        sub: Some(sub),
+                        source,
+                    });
+                }
+                None => {
+                    item.asset_state = 3;
+                    item.asset_error = "Unsupported image source".into();
+                }
+            }
+            row_images.push(item);
+        }
+    } else if parsed.block_type == 60 {
+        if parsed.image_src.trim().is_empty() {
+            asset_state = 3;
+            asset_error = "Missing image source".to_string();
+        } else if let Some(source) = resolve_image_source(&parsed.image_src, base_dir) {
+            asset_state = 1;
+            jobs.push(AssetJob::Image {
+                generation,
+                index,
+                sub: None,
+                source,
+            });
+        } else {
+            asset_state = 3;
+            asset_error = "Unsupported image source".to_string();
+        }
+    } else if parsed.block_type == 70 {
+        asset_state = 1;
+        jobs.push(AssetJob::Mermaid {
+            generation,
+            index,
+            source: parsed.content.clone(),
+            dark,
+        });
+    }
+
+    MarkdownBlock {
+        block_type: parsed.block_type,
+        content: parsed.content.into(),
+        extra: parsed.extra.into(),
+        rich,
+        image: Image::default(),
+        image_alt: parsed.image_alt.into(),
+        link: parsed.link.into(),
+        asset_state,
+        asset_error: asset_error.into(),
+        anchor: parsed.anchor.into(),
+        indent: parsed.indent,
+        images: ModelRc::new(VecModel::from(row_images)),
+        rows: ModelRc::new(VecModel::from(table_rows)),
+        cols: parsed.cols,
+        center: parsed.center,
+        image_width_hint: parsed.image_width,
+    }
+}
+
+fn error_block(message: &str) -> MarkdownBlock {
+    MarkdownBlock {
+        block_type: 10,
+        content: message.into(),
+        extra: "".into(),
+        rich: StyledText::from_plain_text(message),
+        image: Image::default(),
+        image_alt: "".into(),
+        link: "".into(),
+        asset_state: 0,
+        asset_error: "".into(),
+        anchor: "".into(),
+        indent: 0,
+        images: ModelRc::new(VecModel::from(Vec::<ImageItem>::new())),
+        rows: ModelRc::new(VecModel::from(Vec::<TableRow>::new())),
+        cols: 0,
+        center: false,
+        image_width_hint: 0,
+    }
+}
+
+fn apply_result(win: &MainWindow, model: &Rc<VecModel<MarkdownBlock>>, result: AssetResult) {
+    if result.index >= model.row_count() {
+        return;
+    }
+    let Some(mut block) = model.row_data(result.index) else {
+        return;
+    };
+    match result.sub {
+        Some(sub) => {
+            if let Some(mut item) = block.images.row_data(sub) {
+                apply_image_item_result(&mut item, result.result);
+                block.images.set_row_data(sub, item);
+            }
+        }
+        None => {
+            apply_asset_result(win, &mut block, result.result);
+            model.set_row_data(result.index, block);
         }
     }
 }
 
-fn handle_link<F>(
-    window: &MainWindow,
-    render_state: &RenderState,
-    open_file: &F,
-    link: &str,
-) where
+fn handle_link<F>(window: &MainWindow, render_state: &RenderState, open_file: &F, link: &str)
+where
     F: Fn(&Path, Option<&str>),
 {
     let link = link.trim();
@@ -598,7 +734,7 @@ fn schedule_anchor_scroll(window: &MainWindow, render_state: &RenderState, ancho
     let window_weak = window.as_weak();
     let current_model = Rc::clone(&render_state.current_model);
 
-    slint::Timer::single_shot(Duration::from_millis(120), move || {
+    slint::Timer::single_shot(Duration::from_millis(200), move || {
         let Some(window) = window_weak.upgrade() else {
             return;
         };
@@ -682,17 +818,10 @@ fn rerender_mermaid(window: &MainWindow, render_state: &RenderState, dark: bool)
 
 fn payload_to_image(result: Result<AssetPayload, String>) -> Result<Image, String> {
     match result? {
-        AssetPayload::Rgba {
-            width,
-            height,
-            pixels,
-        } => {
-            let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-            buffer.make_mut_bytes().copy_from_slice(&pixels);
-            Ok(Image::from_rgba8(buffer))
+        AssetPayload::Rgba(buffer) => Ok(Image::from_rgba8(buffer)),
+        AssetPayload::Svg(bytes) => {
+            Image::load_from_svg_data(&bytes).map_err(|_| "Failed to decode SVG image".to_string())
         }
-        AssetPayload::Svg(bytes) => Image::load_from_svg_data(&bytes)
-            .map_err(|_| "Failed to decode SVG image".to_string()),
     }
 }
 
@@ -818,7 +947,11 @@ fn load_image(
     agent: &ureq::Agent,
     cache: &Arc<Mutex<HashMap<String, AssetPayload>>>,
 ) -> Result<AssetPayload, String> {
-    if let Some(cached) = cache.lock().ok().and_then(|cache| cache.get(source).cloned()) {
+    if let Some(cached) = cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(source).cloned())
+    {
         return Ok(cached);
     }
 
@@ -848,34 +981,29 @@ fn load_image(
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.eq_ignore_ascii_case("svg"))
             .unwrap_or(false);
-        let bytes = std::fs::read(path)
-            .map_err(|err| format!("Failed to read image {}: {}", path, err))?;
+        let bytes =
+            std::fs::read(path).map_err(|err| format!("Failed to read image {}: {}", path, err))?;
 
         (bytes, svg_hint)
     };
 
     let payload = if svg_hint || looks_like_svg(&bytes) {
-        AssetPayload::Svg(bytes)
+        AssetPayload::Svg(Arc::new(bytes))
     } else {
         let mut image = image::load_from_memory(&bytes)
             .map_err(|err| format!("Failed to decode image: {}", err))?;
 
-        // Keep memory and upload cost bounded for huge screenshots / photos.
         if image.width().max(image.height()) > MAX_IMAGE_DIMENSION {
-            image = image.resize(
-                MAX_IMAGE_DIMENSION,
-                MAX_IMAGE_DIMENSION,
-                image::imageops::FilterType::Triangle,
-            );
+            // thumbnail() is considerably faster than resize()
+            image = image.thumbnail(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION);
         }
 
-        let rgba = image.to_rgba8();
+        let rgba = image.into_rgba8();
         let (width, height) = rgba.dimensions();
-        AssetPayload::Rgba {
-            width,
-            height,
-            pixels: rgba.into_raw(),
-        }
+        // Built here, on the worker; the UI thread only wraps it in an Image.
+        let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
+        buffer.make_mut_bytes().copy_from_slice(rgba.as_raw());
+        AssetPayload::Rgba(buffer)
     };
 
     if let Ok(mut cache) = cache.lock() {
@@ -917,7 +1045,7 @@ fn render_mermaid(
 
     let svg = mermaid_rs_renderer::render_with_options(source, options)
         .map_err(|err| format!("Mermaid render failed: {}", err))?;
-    let payload = AssetPayload::Svg(svg.into_bytes());
+    let payload = AssetPayload::Svg(Arc::new(svg.into_bytes()));
 
     if let Ok(mut cache) = cache.lock() {
         cache.insert(cache_key, payload.clone());

@@ -13,6 +13,18 @@ pub struct ParsedImage {
     pub width: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ParsedCell {
+    pub rich: String,
+    pub plain: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedRow {
+    pub header: bool,
+    pub cells: Vec<ParsedCell>,
+}
+
 /// A block of Markdown ready to be handed to Slint.
 ///
 /// `rich` contains inline Markdown (emphasis, links, code, ...) and is parsed by
@@ -27,6 +39,9 @@ pub struct ParsedBlock {
     pub image_alt: String,
     pub image_width: i32,
     pub images: Vec<ParsedImage>,
+    /// Table rows (block type 80) and the column count.
+    pub rows: Vec<ParsedRow>,
+    pub cols: i32,
     pub link: String,
     pub anchor: String,
     pub indent: i32,
@@ -44,6 +59,8 @@ impl ParsedBlock {
             image_alt: String::new(),
             image_width: 0,
             images: Vec::new(),
+            rows: Vec::new(),
+            cols: 0,
             link: String::new(),
             anchor: String::new(),
             indent: 0,
@@ -71,7 +88,10 @@ enum InlinePiece {
 
 pub fn parse_markdown(markdown: &str) -> Vec<ParsedBlock> {
     let arena = Arena::new();
-    let options = Options::default();
+    let mut options = Options::default();
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.autolink = true;
     let root = parse_document(&arena, markdown, &options);
 
     let mut blocks = Vec::new();
@@ -154,6 +174,10 @@ fn walk_block<'a>(
             }
         }
 
+        NodeValue::Table(_) => {
+            push_table(node, blocks);
+        }
+
         NodeValue::ThematicBreak => {
             blocks.push(ParsedBlock::new(50));
         }
@@ -170,6 +194,39 @@ fn walk_block<'a>(
             }
         }
     }
+}
+
+/// Table (block type 80): rows of cells, each cell holding inline Markdown.
+fn push_table<'a>(node: &'a AstNode<'a>, blocks: &mut Vec<ParsedBlock>) {
+    let mut rows = Vec::new();
+    let mut cols = 0usize;
+
+    for row in node.children() {
+        let header = matches!(row.data.borrow().value, NodeValue::TableRow(true));
+        let mut cells = Vec::new();
+
+        for cell in row.children() {
+            let (rich, plain) = pieces_to_text(&inline_pieces(cell, None));
+            let rich = if header && !rich.is_empty() {
+                format!("**{}**", rich)
+            } else {
+                rich
+            };
+            cells.push(ParsedCell { rich, plain });
+        }
+
+        cols = cols.max(cells.len());
+        rows.push(ParsedRow { header, cells });
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut block = ParsedBlock::new(80);
+    block.rows = rows;
+    block.cols = cols as i32;
+    blocks.push(block);
 }
 
 fn push_list_item<'a>(
@@ -544,12 +601,7 @@ fn attach_link(piece: &mut InlinePiece, href: &str) {
     }
 }
 
-fn wrap_runs(
-    inner: Vec<InlinePiece>,
-    prefix: &str,
-    suffix: &str,
-    output: &mut Vec<InlinePiece>,
-) {
+fn wrap_runs(inner: Vec<InlinePiece>, prefix: &str, suffix: &str, output: &mut Vec<InlinePiece>) {
     for piece in inner {
         match piece {
             InlinePiece::Text(run) => output.push(InlinePiece::Text(InlineRun {
@@ -622,7 +674,11 @@ fn parse_tag_inner(inner: &str) -> Option<HtmlTag> {
         .unwrap_or(inner.len());
     let name = inner[..name_end].to_ascii_lowercase();
 
-    if !name.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+    if !name
+        .chars()
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic())
+    {
         return None;
     }
 

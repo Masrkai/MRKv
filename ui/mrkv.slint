@@ -24,8 +24,18 @@ export struct ImageItem {
     width-hint: int,  // from HTML width="..." (0 = natural size)
 }
 
+export struct TableCell {
+    rich: styled-text,
+    text: string,
+}
+
+export struct TableRow {
+    cells: [TableCell],
+    header: bool,
+}
+
 export struct MarkdownBlock {
-    block-type: int, // 1-6 headings, 10 paragraph, 20 code, 30 list item, 40 blockquote, 50 hr, 60 image, 61 image row, 70 mermaid
+    block-type: int, // 1-6 headings, 10 paragraph, 20 code, 30 list item, 40 blockquote, 50 hr, 60 image, 61 image row, 70 mermaid, 80 table
     content: string,
     extra: string,   // language for code blocks, list marker, etc.
     rich: styled-text,
@@ -37,6 +47,8 @@ export struct MarkdownBlock {
     anchor: string,
     indent: int,
     images: [ImageItem],
+    rows: [TableRow],
+    cols: int,
     center: bool,
     image-width-hint: int,
 }
@@ -97,6 +109,44 @@ component ToolButton inherits Rectangle {
             font-weight: root.primary ? 600 : 500;
             vertical-alignment: center;
             horizontal-alignment: center;
+        }
+    }
+}
+
+// Drawn "sidebar" icon (a window with a left pane); no font glyphs involved.
+component SidebarToggle inherits Rectangle {
+    in property <bool> open;
+    callback clicked();
+
+    width: 36px;
+    height: 30px;
+    border-radius: 6px;
+    background: ta.pressed ? Theme.pressed : ta.has-hover ? Theme.hover : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 20px;
+        height: 16px;
+        border-radius: 3px;
+        border-width: 1.5px;
+        border-color: root.open ? Theme.accent : Theme.fg-muted;
+        clip: true;
+
+        Rectangle {
+            x: 0px;
+            width: 7px;
+            background: root.open ? Theme.accent.transparentize(0.65) : transparent;
+        }
+        Rectangle {
+            x: 7px;
+            width: 1.5px;
+            background: root.open ? Theme.accent : Theme.fg-muted;
         }
     }
 }
@@ -409,6 +459,47 @@ component MarkdownBlockView inherits VerticalLayout {
         }
     }
 
+    // Table
+    if block.block-type == 80 : Rectangle {
+        border-width: 1px;
+        border-color: Theme.border;
+        border-radius: 6px;
+        clip: true;
+
+        VerticalLayout {
+            for row[ri] in block.rows : HorizontalLayout {
+                for cell[ci] in row.cells : Rectangle {
+                    horizontal-stretch: 1;
+                    min-width: 40px;
+                    preferred-width: root.available-width / Math.max(block.cols, 1);
+                    background: row.header ? Theme.code-head : transparent;
+
+                    VerticalLayout {
+                        padding: 8px;
+                        StyledText {
+                            text: cell.rich;
+                            default-color: row.header ? Theme.fg-strong : Theme.fg;
+                            default-font-size: 14px * root.zoom;
+                            link-color: Theme.accent;
+                            link-clicked(link) => { root.link-clicked(link); }
+                        }
+                    }
+
+                    if ci < block.cols - 1 : Rectangle {
+                        x: parent.width - 1px;
+                        width: 1px;
+                        background: Theme.border;
+                    }
+                    if ri < block.rows.length - 1 : Rectangle {
+                        y: parent.height - 1px;
+                        height: 1px;
+                        background: Theme.border;
+                    }
+                }
+            }
+        }
+    }
+
     // Mermaid diagram
     if block.block-type == 70 : Rectangle {
         background: Theme.code-bg;
@@ -523,9 +614,23 @@ export component MainWindow inherits Window {
 
     property <int> scroll-index: -1;
     property <int> scroll-request: 0;
+    // True while Ctrl/Cmd is held: an overlay then turns the mouse wheel into zoom.
+    property <bool> ctrl-down: false;
+    property <length> tail-extra: 0px;
 
     public function reset-scroll() {
-        preview-list.content-y = 0px;
+        root.tail-extra = 0px;
+        preview-list.viewport-y = 0px;
+    }
+
+    function fix-tail() {
+        let visible-bottom = preview-list.absolute-position.y + preview-list.height;
+        let at-end = preview-list.viewport-y <= preview-list.height - preview-list.viewport-height + 1px;
+        let missing = tail.absolute-position.y + 96px - visible-bottom;
+        if (at-end && missing > 1px) {
+            root.tail-extra += missing;
+            preview-list.viewport-y = Math.min(0px, preview-list.height - preview-list.viewport-height);
+        }
     }
 
     // Asks the block at `index` to report its real y position (see `reveal` below).
@@ -539,7 +644,14 @@ export component MainWindow inherits Window {
     init => { keys.focus(); }
 
     keys := FocusScope {
+        key-released(event) => {
+            if (event.text == Key.Control || event.text == Key.Meta) { root.ctrl-down = false; }
+            reject
+        }
+
         key-pressed(event) => {
+            root.ctrl-down = event.modifiers.control || event.modifiers.meta
+                || event.text == Key.Control || event.text == Key.Meta;
             if (event.modifiers.control || event.modifiers.meta) {
                 if (event.text == "=" || event.text == "+") { root.zoom-in(); return accept; }
                 if (event.text == "-") { root.zoom-out(); return accept; }
@@ -552,6 +664,8 @@ export component MainWindow inherits Window {
 
         VerticalLayout {
             HorizontalLayout {
+                vertical-stretch: 1;
+                min-height: 0px;
                 // ───────── Sidebar ─────────
                 Rectangle {
                     width: root.sidebar-visible ? 280px : 0px;
@@ -632,10 +746,18 @@ export component MainWindow inherits Window {
                 main := Rectangle {
                     horizontal-stretch: 1;
                     background: Theme.bg;
+                    clip: true;
 
-                    VerticalLayout {
+                    // Plain container (not a layout) so the scroll area can never
+                    // grow past this pane and slide under the status bar.
+                    Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+
                         // Toolbar
                         Rectangle {
+                            y: 0px;
+                            width: parent.width;
                             height: 46px;
                             background: Theme.toolbar;
 
@@ -652,9 +774,8 @@ export component MainWindow inherits Window {
                                 padding-bottom: 8px;
                                 spacing: 6px;
 
-                                ToolButton {
-                                    text: root.sidebar-visible ? "◧" : "▣";
-                                    active: root.sidebar-visible;
+                                SidebarToggle {
+                                    open: root.sidebar-visible;
                                     clicked => { root.sidebar-visible = !root.sidebar-visible; }
                                 }
 
@@ -691,9 +812,13 @@ export component MainWindow inherits Window {
 
                         // Content
                         preview-list := ScrollView {
-                            vertical-stretch: 1;
+                            y: 46px;
+                            width: parent.width;
+                            height: Math.max(parent.height - 46px, 0px);
+                            viewport-height: content-column.preferred-height;
+                            changed viewport-y => { root.fix-tail(); }
 
-                            VerticalLayout {
+                            content-column := VerticalLayout {
                                 padding-left: Math.max((main.width - 720px * root.font-scale) / 2, 32px);
                                 padding-right: Math.max((main.width - 720px * root.font-scale) / 2, 32px);
                                 padding-top: 32px;
@@ -743,16 +868,40 @@ export component MainWindow inherits Window {
                                     avail-width: Math.max(main.width - 2 * Math.max((main.width - 720px * root.font-scale) / 2, 32px) - 2 * 32px - 16px, 1px);
                                     scroll-index: root.scroll-index;
                                     scroll-request: root.scroll-request;
-                                    reveal(y) => {
-                                        preview-list.content-y = Math.min(0px, Math.max(-y, preview-list.height - preview-list.content-height));
-                                    }
+                                     reveal(y) => {
+                                         preview-list.viewport-y = Math.min(0px, Math.max(-y, preview-list.height - preview-list.viewport-height));
+                                     }
                                     block: b;
                                     zoom: root.font-scale;
                                     copy-code(text) => { root.copy-code(text); }
                                     link-clicked(link) => { root.link-clicked(link); }
                                 }
+
+                                // Extra scrollable space so the last block is always reachable,
+                                // regardless of how much preferred-height under-estimates.
+                                tail := Rectangle {
+                                    height: 120px + root.tail-extra;
+                                    background: transparent;
+                                }
                             }
                         }
+                    }
+
+                    // Ctrl + wheel = zoom. Only exists while Ctrl is held, so it never blocks clicks otherwise.
+                    if root.ctrl-down : TouchArea {
+                        scroll-event(event) => {
+                            if (!event.modifiers.control && !event.modifiers.meta) {
+                                root.ctrl-down = false;
+                                return EventResult.reject;
+                            }
+                            if (event.delta-y > 0px) {
+                                root.font-scale = Math.min(root.font-scale + 0.05, 2.0);
+                            } else if (event.delta-y < 0px) {
+                                root.font-scale = Math.max(root.font-scale - 0.05, 0.7);
+                            }
+                            return EventResult.accept;
+                        }
+                        clicked => { root.ctrl-down = false; }
                     }
                 }
             }

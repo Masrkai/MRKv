@@ -7,6 +7,8 @@ pkgs.mkShell {
     cargo
     rustfmt
     clippy
+    clang
+    python3
   ];
 
   buildInputs = with pkgs; [

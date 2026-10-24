@@ -7,9 +7,10 @@ edition = "2021"
 
 slint = { version = "1.18.1", default-features = false, features = [
     "std",
-    "compat-1-2",             # Mandatory — compile error if missing
-    "renderer-software",      # CPU renderer, no GPU/OpenGL needed
-    "backend-winit-wayland",  # Wayland ONLY (no X11)
+    "compat-1-2",
+    "backend-winit-wayland",
+    "renderer-skia",       # fast GPU renderer
+    "renderer-software",   # fallback: SLINT_BACKEND=winit-software
 ] }
 
 
@@ -24,3 +25,12 @@ mermaid-rs-renderer = { version = "0.3", default-features = false }
 
 [build-dependencies]
 slint-build = "1.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# keep panic = "unwind": the asset workers rely on catch_unwind
+
+[profile.dev.package."*"]
+opt-level = 3   # comrak / image / skia stay fast in debug builds
